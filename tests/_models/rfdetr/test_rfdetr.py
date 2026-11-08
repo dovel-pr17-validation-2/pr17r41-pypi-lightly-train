@@ -1,0 +1,88 @@
+#
+# Copyright (c) Lightly AG and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import pytest
+import torch
+
+from lightly_train._models.rfdetr.rfdetr import RFDETRModelWrapper
+
+if TYPE_CHECKING:
+    from rfdetr.detr import RFDETRBase
+
+pytestmark = pytest.mark.requires("rfdetr")
+
+
+@pytest.fixture
+def model() -> RFDETRBase:
+    from rfdetr.detr import RFDETRBase
+
+    return RFDETRBase()  # type: ignore[no-untyped-call]
+
+
+class TestRFDETRModelWrapper:
+    def test_init(self, model: RFDETRBase) -> None:
+        wrapped_model = RFDETRModelWrapper(model=model)
+
+        for name, param in wrapped_model.named_parameters():
+            assert param.requires_grad, name
+
+        for name, module in wrapped_model.named_modules():
+            assert module.training, name
+
+    def test_feature_dim(self, model: RFDETRBase) -> None:
+        wrapped_model = RFDETRModelWrapper(model=model)
+
+        assert wrapped_model.feature_dim() == 384
+
+    # TODO (Lionel, 05/25): remove this test when MPS is supported
+    @pytest.mark.skipif(
+        torch.backends.mps.is_available(), reason="MPS does not support this test"
+    )
+    def test_forward_features(self, model: RFDETRBase) -> None:
+        device = model.model.device
+
+        wrapped_model = RFDETRModelWrapper(model=model)
+
+        image_size = 224
+        expected_dim = wrapped_model.feature_dim()
+        x = torch.rand(1, 3, image_size, image_size).to(device=device)
+        features = wrapped_model.forward_features(x)["features"]
+
+        assert features.shape == (
+            1,
+            expected_dim,
+            int(image_size // 14),  # we use vit-14 as the backbone
+            int(image_size // 14),
+        )
+
+    def test_forward_pool(self, model: RFDETRBase) -> None:
+        device = model.model.device
+
+        wrapped_model = RFDETRModelWrapper(model=model)
+
+        expected_dim = wrapped_model.feature_dim()
+        x = torch.rand(1, expected_dim, 7, 7).to(device=device)
+        pool = wrapped_model.forward_pool({"features": x})["pooled_features"]
+
+        assert pool.shape == (1, expected_dim, 1, 1)
+
+    def test_get_model(self, model: RFDETRBase) -> None:
+        wrapped_model = RFDETRModelWrapper(model=model)
+        model_ = wrapped_model.get_model()
+        assert model_ is model
+
+    def test__device(self, model: RFDETRBase) -> None:
+        # If this test fails it means the wrapped model doesn't move all required
+        # modules to the correct device. This happens if not all required modules
+        # are registered as attributes of the class.
+        wrapped_model = RFDETRModelWrapper(model=model)
+        wrapped_model.to("meta")
+        wrapped_model.forward_features(torch.rand(1, 3, 224, 224, device="meta"))

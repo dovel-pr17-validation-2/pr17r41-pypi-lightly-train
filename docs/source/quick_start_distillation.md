@@ -1,0 +1,225 @@
+(quick-start-distillation)=
+
+# Quick Start - Distillation
+
+```{image} https://colab.research.google.com/assets/colab-badge.svg
+---
+target: 
+  https://colab.research.google.com/github/lightly-ai/lightly-train/blob/main/examples/notebooks/distillation.ipynb
+---
+```
+
+This guide demonstrates how to pretrain a model on **unlabeled data** with distillation.
+Distillation is a special form of pretraining where a large, pretrained teacher model,
+like DINOv2 or DINOv3, is used to guide the training of a smaller student model. This is
+the ideal starting point if you want to improve performance of any model that is not
+already a large vision foundation model, like YOLO, ConvNet, or special transformer
+architectures.
+
+The quick start covers the following steps:
+
+1. Install Lightly**Train**
+1. Prepare your unlabeled dataset
+1. Pretrain a model with distillation
+1. Fine-tune the pretrained model on a downstream task
+
+## Installation
+
+```bash
+pip install lightly-train
+```
+
+```{important}
+Lightly**Train** is officially supported on:
+- Linux: CPU or CUDA
+- MacOS: CPU only
+- Windows (experimental): CPU or CUDA
+
+We are planning to support MPS for MacOS.
+
+Check the [installation instructions](installation.md#installation) for more
+details.
+```
+
+## Prepare Data
+
+You can use any image dataset for training. No labels are required, and the dataset can
+be structured in any way, including subdirectories. If you don't have a dataset at hand,
+you can download an example dataset:
+
+```bash
+wget https://github.com/lightly-ai/coco128_yolo/releases/download/v0.0.3/object_detection.zip && unzip -q object_detection.zip
+```
+
+See the [data guide](pretrain-data) for more information on supported data formats.
+
+The archive also contains labels, which are only needed later for
+[fine-tuning](#fine-tune). Pretraining uses the images in
+`object_detection/images/train2017`:
+
+```text
+object_detection
+├── config.yaml
+├── images
+│   ├── train2017
+│   │   ├── 000000000009.jpg
+│   │   ├── ...
+│   │   └── 000000000650.jpg
+│   └── val2017
+│       ├── 000000000139.jpg
+│       ├── ...
+│       └── 000000013201.jpg
+└── labels
+    ├── train2017
+    └── val2017
+```
+
+## Pretrain with Distillation
+
+Once the data is ready, you can pretrain the model like this:
+
+```python
+import lightly_train
+
+# Pretrain the model
+lightly_train.pretrain(
+    out="out/my_experiment",  # Output directory
+    data="object_detection/images/train2017",  # Directory with images
+    model="dinov3/vitt16",  # Model to train
+    method="distillation",  # Pretraining method
+    method_args={
+        "teacher": "dinov3/vits16"  # Teacher model for distillation
+    },
+    epochs=5,  # Small number of epochs for demonstration
+    batch_size=32,  # Small batch size for demonstration
+)
+```
+
+```{note}
+If you omit `method_args={"teacher": ...}`, LightlyTrain uses its default teacher for
+the chosen distillation version. For `distillation` / `distillationv3` that default is
+`dinov3/vitb16` (DINOv3 ViT-B/16). See
+{ref}`methods-distillation-default-teacher` for the per-version defaults and how to
+switch to a DINOv2 teacher. You can also use a custom teacher model — see
+{ref}`methods-distillation-custom-models`.
+```
+
+```{note}
+This is a minimal example for illustration purposes. In practice you would want to use a
+larger dataset (>=10'000 images), more epochs (>=100, ideally ~1000), and a larger
+batch size (>=128). For pretraining larger models than `dinov3/vitt16` we also recommend
+using a larger teacher model and setting `method="distillationv1"`.
+```
+
+```{tip}
+Lightly**Train** supports many [popular models](pretrain_distill/models/index.md)
+out of the box.
+```
+
+This pretrains a tiny DINOv3 ViT model using images from
+`object_detection/images/train2017`. All training logs, model exports, and checkpoints
+are saved to the output directory at `out/my_experiment`.
+
+Once the training is complete, the `out/my_experiment` directory contains the following
+files:
+
+```text
+out/my_experiment
+├── checkpoints
+│   ├── epoch=03-step=123.ckpt          # Intermediate checkpoint
+│   └── last.ckpt                       # Last checkpoint
+├── events.out.tfevents.123.0           # Tensorboard logs
+├── exported_models
+|   └── exported_last.pt                # Final model exported
+├── metrics.jsonl                       # Training metrics
+└── train.log                           # Training logs
+```
+
+The final model is exported to `out/my_experiment/exported_models/exported_last.pt` in
+the default format of the used library. It can directly be used for fine-tuning. See
+[export format](pretrain_distill/export.md#format) for more information on how to export
+models to other formats or on how to export intermediate checkpoints.
+
+While the trained model has already learned good representations of the images, it
+cannot yet make any predictions for tasks such as classification, detection, or
+segmentation. To solve these tasks, the model needs to be fine-tuned on a labeled
+dataset.
+
+## Fine-Tune
+
+Now the model is ready for fine-tuning! You can use your favorite library for this step.
+We'll use Lightly**Train**'s built-in fine-tuning for object detection as an example.
+
+### Prepare Labeled Data
+
+A labeled dataset is required for fine-tuning. The `object_detection` dataset you
+downloaded in [Prepare Data](#prepare-data) already contains YOLO labels and a
+`config.yaml` with the dataset paths and the 80 COCO class names.
+
+### Fine-Tune the Pretrained Model
+
+Once the dataset is ready, you can fine-tune the pretrained model like this:
+
+```python
+import lightly_train
+
+lightly_train.train_object_detection(
+    out="out/my_finetune_experiment",
+    model="dinov3/vitt16-ltdetr",
+    model_args={
+        # Load the pretrained weights.
+        "backbone_weights": "out/my_experiment/exported_models/exported_last.pt",
+    },
+    steps=100,  # Small number of steps for demonstration, default is 90_000.
+    batch_size=4,  # Small batch size for demonstration, default is 16.
+    data="object_detection/config.yaml",
+)
+```
+
+`data` also accepts a dictionary with the same keys as the YAML file, see
+[object detection data](object-detection-data) for details.
+
+This will load the pretrained model from
+`out/my_experiment/exported_models/exported_last.pt` and fine-tune it on a subset of the
+labeled COCO dataset for 100 steps.
+
+Congratulations! You've just trained and fine-tuned a model using Lightly**Train**!
+
+## Generate Embeddings
+
+Instead of fine-tuning the model, you can also use it to generate image embeddings. This
+is useful for clustering, retrieval, or visualization tasks. The `embed` command
+generates embeddings for all images in a directory:
+
+```python
+import lightly_train
+
+lightly_train.embed(
+    out="my_embeddings.pth",  # Exported embeddings
+    checkpoint="out/my_experiment/checkpoints/last.ckpt",  # LightlyTrain checkpoint
+    data="object_detection/images/train2017",  # Directory with images
+)
+```
+
+The embeddings are saved to `my_embeddings.pth`. Let's load them and take a look:
+
+```python
+import torch
+
+embeddings = torch.load("my_embeddings.pth")
+print("First five filenames:")
+print(embeddings["filenames"][:5])  # Print first five filenames
+print("\nEmbedding tensor shape:")
+print(
+    embeddings["embeddings"].shape
+)  # Tensor with embeddings with shape (num_images, embedding_dim)
+```
+
+## Next Steps
+
+- [Object Detection Quick Start](quick-start-object-detection): If you want to learn
+  more about fine-tuning and how to use the fine-tuned model for inference.
+- [Distillation Guide](pretrain-distill): If you want to learn more about distillation
+  and how to pretrain any model with it.
+- [DINOv2 Pretraining](methods-dinov2): If you want to learn how to pretrain foundation
+  models.

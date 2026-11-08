@@ -1,0 +1,1398 @@
+#
+# Copyright (c) Lightly AG and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+import yaml
+from lightning_utilities.core.imports import RequirementCache
+from pydantic import ValidationError
+from pytest import LogCaptureFixture
+
+import lightly_train
+from lightly_train._commands import train_task
+from lightly_train._commands.train_task import (
+    ImageClassificationMulticlassTrainTaskConfig,
+    ImageClassificationMultiheadMulticlassTrainTaskConfig,
+    ImageClassificationMultiheadMultilabelTrainTaskConfig,
+    ImageClassificationMultilabelTrainTaskConfig,
+    InstanceSegmentationTrainTaskConfig,
+    ObjectDetectionTrainTaskConfig,
+    PanopticSegmentationTrainTaskConfig,
+    SemanticSegmentationMultiheadTrainTaskConfig,
+    SemanticSegmentationTrainTaskConfig,
+)
+from lightly_train._data import data_helpers as data_arg_helpers
+from lightly_train._data.coco_object_detection_dataset import (
+    COCOObjectDetectionDataArgs,
+)
+from lightly_train._data.file_helpers import PYDICOM_GEQ_3_0_0
+from lightly_train._data.image_classification_dataset import (
+    ImageClassificationMulticlassDataArgs,
+    ImageClassificationMultilabelDataArgs,
+)
+from lightly_train._data.instance_segmentation_dataset import (
+    COCOInstanceSegmentationDataArgs,
+    YOLOInstanceSegmentationDataArgs,
+)
+from lightly_train._data.mask_panoptic_segmentation_dataset import (
+    MaskPanopticSegmentationDataArgs,
+)
+from lightly_train._data.mask_semantic_segmentation_dataset import (
+    MaskSemanticSegmentationDataArgs,
+)
+from lightly_train._data.yolo_object_detection_dataset import (
+    YOLOObjectDetectionDataArgs,
+)
+from lightly_train._metrics.task_metric import TORCHMETRICS_GEQ_1_5
+from lightly_train._transforms.albumentations_helpers import ALBUMENTATIONS_GEQ_2_0_0
+from lightly_train.errors import LightlyTrainError
+
+from .. import helpers
+
+pytestmark = pytest.mark.requires(ALBUMENTATIONS_GEQ_2_0_0, TORCHMETRICS_GEQ_1_5)
+
+
+def test_train_image_classification__multiclass(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    helpers.create_multiclass_image_classification_dataset(
+        tmp_path=data,
+        class_names=["class_0", "class_1"],
+        num_files_per_class=2,
+    )
+
+    lightly_train.train_image_classification(
+        out=out,
+        model="dinov3/vitt16-notpretrained",
+        data={
+            "train": data / "train",
+            "val": data / "val",
+            "classes": {
+                0: "class_0",
+                1: "class_1",
+            },
+        },
+        steps=2,
+        batch_size=2,
+        num_workers=0,
+        devices=1,
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    # Check that model can be loaded again
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+
+    # Check forward pass
+    results = model.predict(torch.randn(3, 224, 224))
+    assert results["labels"].shape == (1,)
+    assert results["scores"].shape == (1,)
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+def test_train_image_classification__multilabel(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    classes = {
+        0: "class_0",
+        1: "class_1",
+        2: "class_2",
+    }
+    helpers.create_multilabel_image_classification_dataset(
+        tmp_path=data,
+        classes=classes,
+        num_files=4,
+    )
+    lightly_train.train_image_classification(
+        out=out,
+        model="dinov3/vitt16-notpretrained",
+        classification_task="multilabel",
+        data={
+            "train": data / "train.csv",
+            "val": data / "val.csv",
+            "classes": classes,
+        },
+        steps=2,
+        batch_size=2,
+        num_workers=0,
+        devices=1,
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+    # Check forward pass
+    results = model.predict(torch.randn(3, 224, 224), threshold=-1)  # type: ignore[call-arg]
+    assert results["labels"].shape == (3,)
+    assert results["scores"].shape == (3,)
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+def test_train_image_classification_multihead(
+    tmp_path: Path,
+) -> None:
+    """Integration test for multihead training with multiple learning rates."""
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    helpers.create_multiclass_image_classification_dataset(
+        tmp_path=data,
+        class_names=["class_0", "class_1"],
+        num_files_per_class=2,
+    )
+
+    # Train with multiple learning rates.
+    lightly_train.train_image_classification_multihead(
+        out=out,
+        model="dinov3/vitt16-notpretrained",
+        data={
+            "train": data / "train",
+            "val": data / "val",
+            "classes": {
+                0: "class_0",
+                1: "class_1",
+            },
+        },
+        model_args={
+            "lr": [0.001, 0.01, 0.1],
+        },
+        steps=2,
+        batch_size=2,
+        num_workers=0,
+        devices=1,
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+    )
+
+    # Verify outputs.
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+    assert (out / "checkpoints" / "last.ckpt").exists()
+    assert (out / "exported_models" / "exported_last.pt").exists()
+
+    # Check that model can be loaded (but don't test predict yet).
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+    assert model is not None
+
+
+@pytest.mark.parametrize(
+    "num_workers",
+    [
+        0,
+        # num_workers=2 exercises the real multi-worker DataLoader code path,
+        # but worker process spawn dominates its runtime (especially on
+        # Windows), so it's excluded from fast CI via long_running_test.
+        pytest.param(2, marks=pytest.mark.long_running_test),
+    ],
+    ids=["fast", "multi_worker_dataloader"],
+)
+def test_train_object_detection_yolo(tmp_path: Path, num_workers: int) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    # Create dataset with 4 files, including one without a label file (index 2) and
+    # one with an empty label file (index 3).
+    helpers.create_yolo_object_detection_dataset(
+        data,
+        split_first=True,
+        num_files=4,
+        missing_label_indices=[2],
+        empty_label_indices=[3],
+    )
+
+    # Check training
+    lightly_train.train_object_detection(
+        out=out,
+        model="dinov2/_vittest14-ltdetrv2",
+        data={
+            "path": data,
+            "train": Path("train", "images"),
+            "val": Path("val", "images"),
+            "names": {
+                0: "class_0",
+                1: "class_1",
+            },
+        },
+        model_args={
+            "scheduler_name": "linear",
+        },
+        steps=2,
+        batch_size=2,
+        num_workers=num_workers,
+        devices=1,
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    # Check that model can be loaded again
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+
+    # Check that only EMA weights are exported
+    exported_state_dict = torch.load(
+        out / "exported_models" / "exported_last.pt", map_location="cpu"
+    )
+    assert all(
+        key.startswith("ema_model.")
+        for key in exported_state_dict["train_model"].keys()
+    )
+
+    # Check forward pass
+    dummy_input = torch.randn(3, 100, 200)
+    results = model.predict(dummy_input)
+    assert results["bboxes"].ndim == 2
+    assert results["bboxes"].shape[1] == 4
+    assert results["scores"].ndim == 1
+    assert results["labels"].ndim == 1
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+def test_train_instance_segmentation(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    helpers.create_coco_instance_segmentation_dataset(data, num_files=4)
+
+    # Check training
+    lightly_train.train_instance_segmentation(
+        out=out,
+        data={
+            "format": "coco",
+            "train": {"annotations": str(data / "train.json"), "images": "train"},
+            "val": {"annotations": str(data / "val.json"), "images": "val"},
+        },
+        model="edgecrafter/_ecvittest-ltdetr-seg",
+        model_args={"scheduler_name": "linear"},
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    # Check that the model can be loaded again
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+
+    # Check forward pass
+    dummy_input = torch.randn(3, 100, 200)
+    results = model.predict(dummy_input)
+
+    assert results["labels"].ndim == 1
+    assert results["masks"].ndim == 3
+    assert results["masks"].shape[-2:] == dummy_input.shape[1:]
+    assert results["scores"].ndim == 1
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+def test_train_panoptic_segmentation(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    helpers.create_coco_panoptic_segmentation_dataset(data, num_files=4)
+
+    # Check training
+    lightly_train.train_panoptic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": data / "images" / "train",
+                "masks": data / "annotations" / "train",
+                "annotations": data / "annotations" / "train.json",
+            },
+            "val": {
+                "images": data / "images" / "val",
+                "masks": data / "annotations" / "val",
+                "annotations": data / "annotations" / "val.json",
+            },
+        },
+        model="dinov3/vitt16-notpretrained-eomt",
+        model_args={"num_joint_blocks": 1},
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    # Check that the model can be loaded again
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+
+    # Check forward pass
+    dummy_input = torch.randn(3, 100, 200)
+    results = model.predict(dummy_input)
+    assert results["masks"].shape == (100, 200, 2)
+    assert results["segment_ids"].ndim == 1
+    assert results["scores"].ndim == 1
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+def test_train_panoptic_segmentation__dinov2(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    data = tmp_path / "data"
+    helpers.create_coco_panoptic_segmentation_dataset(data, num_files=4)
+
+    # Check training
+    # Reduce number of joint blocks for _vittest14.
+    lightly_train.train_panoptic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": data / "images" / "train",
+                "masks": data / "annotations" / "train",
+                "annotations": data / "annotations" / "train.json",
+            },
+            "val": {
+                "images": data / "images" / "val",
+                "masks": data / "annotations" / "val",
+                "annotations": data / "annotations" / "val.json",
+            },
+        },
+        model="dinov2/_vittest14-eomt",
+        model_args={"num_joint_blocks": 1},
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    # Check that the model can be loaded again
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+
+    # Check forward pass
+    dummy_input = torch.randn(3, 100, 200)
+    results = model.predict(dummy_input)
+    assert results["masks"].shape == (100, 200, 2)
+    assert results["segment_ids"].ndim == 1
+    assert results["scores"].ndim == 1
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+@pytest.mark.parametrize(
+    "model_name, model_args",
+    [
+        # Reduce number of joint blocks _vittest14.
+        ("dinov2/_vittest14-eomt", {"num_joint_blocks": 1}),
+        ("dinov2/_vittest14-linear", {}),
+    ],
+)
+@pytest.mark.parametrize("num_channels", [3, 4])
+def test_train_semantic_segmentation(
+    tmp_path: Path, model_name: str, model_args: dict[str, Any], num_channels: int
+) -> None:
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+    mode = "RGB" if num_channels == 3 else "RGBA"
+    helpers.create_images(train_images, num_channels=num_channels, mode=mode)
+    helpers.create_semantic_segmentation_masks(train_masks)
+    helpers.create_images(val_images, num_channels=num_channels, mode=mode)
+    helpers.create_semantic_segmentation_masks(val_masks)
+
+    lightly_train.train_semantic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "car",
+            },
+        },
+        model=model_name,
+        model_args=model_args,
+        # The operator 'aten::upsample_bicubic2d.out' raises a NotImplementedError
+        # on macOS with MPS backend.
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+        transform_args={
+            "num_channels": num_channels,
+        },
+    )
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+    # Check forward pass
+    dummy_input = torch.randn(1, num_channels, 224, 224)
+    prediction = model.predict(dummy_input[0])
+    assert prediction.shape == (224, 224)
+    assert prediction.min() >= 0
+    assert prediction.max() <= 1
+
+    # Check that example images were logged for training and validation.
+    image_examples_dir = out / "image_examples"
+    assert image_examples_dir.exists()
+    assert (image_examples_dir / "train_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_labels_0.jpg").exists()
+    assert (image_examples_dir / "val_predictions_0.jpg").exists()
+
+
+@pytest.mark.requires(PYDICOM_GEQ_3_0_0)
+@pytest.mark.parametrize(
+    ("data_format, num_channels, height, width"),
+    [
+        ("mr", 1, 64, 64),
+        ("ct", 1, 128, 128),
+        ("overlay", 1, 300, 484),
+        ("rgb_color", 3, 240, 320),
+        ("palette_color", 3, 350, 800),
+        ("jpeg2k", 3, 480, 640),
+    ],
+)
+def test_train_semantic_segmentation__dicom(
+    tmp_path: Path,
+    data_format: str,
+    num_channels: int,
+    height: int,
+    width: int,
+) -> None:
+    from pydicom import examples as pydicom_examples
+
+    data_path: Path = pydicom_examples.get_path(data_format)
+
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+
+    train_images.mkdir(parents=True, exist_ok=True)
+    for index in range(4):
+        image_filename = f"{index}_{data_path.name}"
+        target = train_images / image_filename
+        target.symlink_to(data_path)
+    train_mask_filenames = [f"{index}_{data_path.stem}.png" for index in range(4)]
+    helpers.create_semantic_segmentation_masks(
+        train_masks,
+        files=train_mask_filenames,
+        height=height,
+        width=width,
+    )
+
+    val_images.mkdir(parents=True, exist_ok=True)
+    for index in range(2):
+        image_filename = f"{index}_{data_path.name}"
+        target = val_images / image_filename
+        target.symlink_to(data_path)
+    val_mask_filenames = [f"{index}_{data_path.stem}.png" for index in range(2)]
+    helpers.create_semantic_segmentation_masks(
+        val_masks,
+        files=val_mask_filenames,
+        height=height,
+        width=width,
+    )
+
+    lightly_train.train_semantic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "lesion",
+            },
+        },
+        model="dinov2/_vittest14-eomt",
+        model_args={"num_joint_blocks": 1},
+        # The operator 'aten::upsample_bicubic2d.out' raises a NotImplementedError
+        # on macOS with MPS backend.
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+        transform_args={
+            "num_channels": num_channels,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "model_name, model_args",
+    [
+        # Reduce number of joint blocks _vittest14.
+        ("dinov2/_vittest14-eomt", {"num_joint_blocks": 1}),
+        ("dinov2/_vittest14-linear", {}),
+    ],
+)
+@pytest.mark.parametrize("num_channels", [3, 4])
+def test_train_semantic_segmentation__export(
+    tmp_path: Path, model_name: str, model_args: dict[str, Any], num_channels: int
+) -> None:
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+    mode = "RGB" if num_channels == 3 else "RGBA"
+    helpers.create_images(train_images, num_channels=num_channels, mode=mode)
+    helpers.create_semantic_segmentation_masks(train_masks)
+    helpers.create_images(val_images, num_channels=num_channels, mode=mode)
+    helpers.create_semantic_segmentation_masks(val_masks)
+
+    lightly_train.train_semantic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "car",
+            },
+        },
+        model=model_name,
+        model_args=model_args,
+        # The operator 'aten::upsample_bicubic2d.out' raises a NotImplementedError
+        # on macOS with MPS backend.
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,
+        transform_args={
+            "num_channels": num_channels,
+        },
+    )
+
+    # Check that last.ckpt and exported_model.pt contain same information.
+    ckpt_model_state_dict = lightly_train.load_model(
+        out / "checkpoints" / "last.ckpt"
+    ).state_dict()
+    exported_model_state_dict = lightly_train.load_model(
+        out / "exported_models" / "exported_last.pt"
+    ).state_dict()
+    assert ckpt_model_state_dict.keys() == exported_model_state_dict.keys()
+    for key in ckpt_model_state_dict.keys():
+        assert torch.equal(ckpt_model_state_dict[key], exported_model_state_dict[key])
+
+
+def test_train_semantic_segmentation__checkpoint(
+    tmp_path: Path, caplog: LogCaptureFixture
+) -> None:
+    """Assert that load_checkpoint_from_file is called when a checkpoint is provided."""
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+    helpers.create_images(train_images)
+    helpers.create_semantic_segmentation_masks(train_masks)
+    helpers.create_images(val_images)
+    helpers.create_semantic_segmentation_masks(val_masks)
+
+    # Part 1: Generate a checkpoint.
+    lightly_train.train_semantic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "car",
+            },
+        },
+        model="dinov2/_vittest14-eomt",
+        model_args={"num_joint_blocks": 1},
+        # The operator 'aten::upsample_bicubic2d.out' raises a NotImplementedError
+        # on macOS with MPS backend.
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=1,
+    )
+    last_ckpt_path = out / "exported_models" / "exported_last.pt"
+    assert last_ckpt_path.exists()
+
+    # Part 2: Load the checkpoint via the checkpoint parameter and assert log.
+    with caplog.at_level(logging.INFO):
+        lightly_train.train_semantic_segmentation(
+            out=out,
+            data={
+                "train": {
+                    "images": train_images,
+                    "masks": train_masks,
+                },
+                "val": {
+                    "images": val_images,
+                    "masks": val_masks,
+                },
+                "classes": {
+                    0: "background",
+                    1: "car",
+                },
+            },
+            model=str(last_ckpt_path),
+            model_args={"num_joint_blocks": 1},
+            accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+            devices=1,
+            batch_size=2,
+            num_workers=0,
+            steps=1,
+            overwrite=True,
+        )
+    assert f"Loading model checkpoint from '{last_ckpt_path}'" in caplog.text
+
+    # Part 3: check that the class head can be re-initialized when the number of classes differ.
+    with caplog.at_level(logging.INFO):
+        lightly_train.train_semantic_segmentation(
+            out=out,
+            data={
+                "train": {
+                    "images": train_images,
+                    "masks": train_masks,
+                },
+                "val": {
+                    "images": val_images,
+                    "masks": val_masks,
+                },
+                "classes": {
+                    0: "background",
+                    1: "car",
+                    2: "tree",
+                },
+            },
+            model=str(last_ckpt_path),
+            model_args={"num_joint_blocks": 1},
+            accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+            devices=1,
+            batch_size=2,
+            num_workers=0,
+            steps=1,
+            overwrite=True,
+        )
+    assert "Checkpoint provides 2 classes but module expects 3." in caplog.text
+
+
+def test_train_semantic_segmentation__resume_interrupted(
+    tmp_path: Path, caplog: LogCaptureFixture
+) -> None:
+    """Assert that resume_interrupted loads the last checkpoint from the output dir."""
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+    helpers.create_images(train_images)
+    helpers.create_semantic_segmentation_masks(train_masks)
+    helpers.create_images(val_images)
+    helpers.create_semantic_segmentation_masks(val_masks)
+
+    # Part 1: Generate a checkpoint that can be resumed.
+    lightly_train.train_semantic_segmentation(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "car",
+            },
+        },
+        model="dinov2/_vittest14-eomt",
+        model_args={"num_joint_blocks": 1},
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=1,
+    )
+    last_ckpt_path = out / "checkpoints" / "last.ckpt"
+    assert last_ckpt_path.exists()
+
+    # Part 2: Resume from the generated checkpoint without providing ckpt explicitly.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        lightly_train.train_semantic_segmentation(
+            out=out,
+            data={
+                "train": {
+                    "images": train_images,
+                    "masks": train_masks,
+                },
+                "val": {
+                    "images": val_images,
+                    "masks": val_masks,
+                },
+                "classes": {
+                    0: "background",
+                    1: "car",
+                },
+            },
+            model="dinov2/_vittest14-eomt",
+            model_args={"num_joint_blocks": 1},
+            accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+            devices=1,
+            batch_size=2,
+            num_workers=0,
+            steps=1,
+            resume_interrupted=True,
+        )
+
+    assert f"Resuming training from model checkpoint '{last_ckpt_path}'" in caplog.text
+    assert "Resuming training from step 1/1..." in caplog.text
+
+
+def test_train_semantic_segmentation_multihead__integration__runs_with_multiple_heads(
+    tmp_path: Path,
+) -> None:
+    """Integration test for multihead semantic segmentation with multiple learning rates."""
+    out = tmp_path / "out"
+    train_images = tmp_path / "train_images"
+    train_masks = tmp_path / "train_masks"
+    val_images = tmp_path / "val_images"
+    val_masks = tmp_path / "val_masks"
+
+    # Create dataset using helpers
+    helpers.create_images(train_images)
+    helpers.create_semantic_segmentation_masks(train_masks)
+    helpers.create_images(val_images)
+    helpers.create_semantic_segmentation_masks(val_masks)
+
+    # Train with multiple learning rates
+    lightly_train.train_semantic_segmentation_multihead(
+        out=out,
+        data={
+            "train": {
+                "images": train_images,
+                "masks": train_masks,
+            },
+            "val": {
+                "images": val_images,
+                "masks": val_masks,
+            },
+            "classes": {
+                0: "background",
+                1: "car",
+            },
+        },
+        model="dinov2/_vittest14",  # Tiny test-only model for fast testing
+        model_args={
+            "lr": [0.001, 0.01],  # Test with two learning rates
+        },
+        accelerator="auto" if not sys.platform.startswith("darwin") else "cpu",
+        devices=1,
+        batch_size=2,
+        num_workers=0,
+        steps=2,  # Minimal steps for fast test
+    )
+
+    # Verify outputs existence
+    assert out.exists()
+    assert out.is_dir()
+    assert (out / "train.log").exists()
+    assert (out / "checkpoints" / "last.ckpt").exists()
+    assert (out / "exported_models" / "exported_last.pt").exists()
+
+    # Load model and verify it works
+    model = lightly_train.load_model(model=out / "exported_models" / "exported_last.pt")
+    assert model is not None
+
+    # Test forward pass - should return dict with predictions per head
+    dummy_input = torch.randn(3, 224, 224)
+    predictions = model.predict(dummy_input)
+    assert isinstance(predictions, dict)
+    assert len(predictions) == 2  # Should have 2 heads for 2 learning rates
+    for head_name, prediction in predictions.items():
+        assert prediction.shape == (224, 224)  # Each prediction should be (H, W)
+        assert prediction.min() >= 0
+        assert prediction.max() <= 1  # Should be class indices 0 or 1
+
+
+@pytest.mark.parametrize("path_type", [str, Path])
+@pytest.mark.parametrize(
+    "config_cls, task, expected_data_args_cls",
+    [
+        (
+            ObjectDetectionTrainTaskConfig,
+            "object_detection",
+            COCOObjectDetectionDataArgs,
+        ),
+        (
+            InstanceSegmentationTrainTaskConfig,
+            "instance_segmentation",
+            COCOInstanceSegmentationDataArgs,
+        ),
+    ],
+)
+def test_create_train_task_config__data_is_coco_yaml(
+    tmp_path: Path,
+    path_type: type,
+    config_cls: type[
+        ObjectDetectionTrainTaskConfig | InstanceSegmentationTrainTaskConfig
+    ],
+    task: str,
+    expected_data_args_cls: type[
+        COCOObjectDetectionDataArgs | COCOInstanceSegmentationDataArgs
+    ],
+) -> None:
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "format": "coco",
+                "train": {"annotations": "train.json"},
+                "val": {"annotations": "val.json"},
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+    config = config_cls(
+        out="out",
+        model="some/model",
+        task=task,  # type: ignore[arg-type]
+        data=path_type(data_yaml),  # type: ignore[arg-type]
+    )
+    assert isinstance(config.data, expected_data_args_cls)
+    assert config.data.format == "coco"
+    assert config.data.train.annotations == "train.json"
+    assert config.data.val.annotations == "val.json"
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+
+@pytest.mark.parametrize("path_type", [str, Path])
+@pytest.mark.parametrize(
+    "config_cls, task, expected_data_args_cls",
+    [
+        (
+            ObjectDetectionTrainTaskConfig,
+            "object_detection",
+            YOLOObjectDetectionDataArgs,
+        ),
+        (
+            InstanceSegmentationTrainTaskConfig,
+            "instance_segmentation",
+            YOLOInstanceSegmentationDataArgs,
+        ),
+    ],
+)
+def test_create_train_task_config__data_yaml_defaults_to_yolo(
+    tmp_path: Path,
+    path_type: type,
+    config_cls: type[
+        ObjectDetectionTrainTaskConfig | InstanceSegmentationTrainTaskConfig
+    ],
+    task: str,
+    expected_data_args_cls: type[
+        YOLOObjectDetectionDataArgs | YOLOInstanceSegmentationDataArgs
+    ],
+) -> None:
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "path": str(tmp_path),
+                "train": "images/train",
+                "val": "images/val",
+                "names": {0: "class_a"},
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+    config = config_cls(
+        out="out",
+        model="some/model",
+        task=task,  # type: ignore[arg-type]
+        data=path_type(data_yaml),  # type: ignore[arg-type]
+    )
+    assert isinstance(config.data, expected_data_args_cls)
+    assert config.data.format == "yolo"
+    assert config.data.path == str(tmp_path)
+    assert config.data.train == Path("images/train")
+    assert config.data.val == Path("images/val")
+    assert config.data.names == {0: "class_a"}
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+
+def test_create_train_task_config__direct_data_has_no_data_config_file(
+    tmp_path: Path,
+) -> None:
+    config = ObjectDetectionTrainTaskConfig(
+        out="out",
+        model="some/model",
+        task="object_detection",
+        data={  # type: ignore[arg-type]
+            "path": str(tmp_path),
+            "train": "images/train",
+            "val": "images/val",
+            "names": {0: "class_a"},
+        },
+    )
+
+    assert isinstance(config.data, YOLOObjectDetectionDataArgs)
+    assert config.data.data_config_file is None
+    assert "data_config_file" not in config.model_dump()["data"]
+
+
+@pytest.mark.parametrize("path_type", [str, Path])
+@pytest.mark.parametrize(
+    "config_cls, expected_data_args_cls",
+    [
+        (
+            ImageClassificationMulticlassTrainTaskConfig,
+            ImageClassificationMulticlassDataArgs,
+        ),
+        (
+            ImageClassificationMultilabelTrainTaskConfig,
+            ImageClassificationMultilabelDataArgs,
+        ),
+        (
+            ImageClassificationMultiheadMulticlassTrainTaskConfig,
+            ImageClassificationMulticlassDataArgs,
+        ),
+        (
+            ImageClassificationMultiheadMultilabelTrainTaskConfig,
+            ImageClassificationMultilabelDataArgs,
+        ),
+    ],
+)
+def test_create_train_task_config__image_classification_data_yaml(
+    tmp_path: Path,
+    path_type: type,
+    config_cls: type[
+        ImageClassificationMulticlassTrainTaskConfig
+        | ImageClassificationMultilabelTrainTaskConfig
+        | ImageClassificationMultiheadMulticlassTrainTaskConfig
+        | ImageClassificationMultiheadMultilabelTrainTaskConfig
+    ],
+    expected_data_args_cls: type[
+        ImageClassificationMulticlassDataArgs | ImageClassificationMultilabelDataArgs
+    ],
+) -> None:
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train": "train",
+                "val": "val",
+                "classes": {0: "class_a"},
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+
+    config = config_cls(
+        out="out",
+        model="some/model",
+        data=path_type(data_yaml),
+    )
+
+    assert isinstance(config.data, expected_data_args_cls)
+    assert config.data.train == "train"
+    assert config.data.val == "val"
+    assert config.data.classes == {0: "class_a"}
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+
+@pytest.mark.parametrize(
+    "config_cls, expected_data_args_cls",
+    [
+        (
+            ImageClassificationMulticlassTrainTaskConfig,
+            ImageClassificationMulticlassDataArgs,
+        ),
+        (
+            ImageClassificationMultilabelTrainTaskConfig,
+            ImageClassificationMultilabelDataArgs,
+        ),
+    ],
+)
+def test_create_train_task_config__image_classification_csv_aliases(
+    config_cls: type[
+        ImageClassificationMulticlassTrainTaskConfig
+        | ImageClassificationMultilabelTrainTaskConfig
+    ],
+    expected_data_args_cls: type[
+        ImageClassificationMulticlassDataArgs | ImageClassificationMultilabelDataArgs
+    ],
+) -> None:
+    config = config_cls(
+        out="out",
+        model="some/model",
+        data={  # type: ignore[arg-type]
+            "train_csv": "train.csv",
+            "val_csv": "val.csv",
+            "classes": {0: "class_a"},
+        },
+    )
+
+    assert isinstance(config.data, expected_data_args_cls)
+    assert config.data.train == "train.csv"
+    assert config.data.val == "val.csv"
+    assert "train_csv" not in config.model_dump()["data"]
+    assert "val_csv" not in config.model_dump()["data"]
+
+
+def test_create_train_task_config__image_classification_csv_alias_conflict() -> None:
+    with pytest.raises(
+        ValidationError, match="Cannot specify both 'train' and 'train_csv'"
+    ):
+        ImageClassificationMulticlassTrainTaskConfig(
+            out="out",
+            model="some/model",
+            data={  # type: ignore[arg-type]
+                "train": "train",
+                "train_csv": "train.csv",
+                "val": "val",
+                "classes": {0: "class_a"},
+            },
+        )
+
+    with pytest.raises(
+        ValidationError, match="Cannot specify both 'val' and 'val_csv'"
+    ):
+        ImageClassificationMulticlassTrainTaskConfig(
+            out="out",
+            model="some/model",
+            data={  # type: ignore[arg-type]
+                "train": "train",
+                "val": "val",
+                "val_csv": "val.csv",
+                "classes": {0: "class_a"},
+            },
+        )
+
+
+def test_create_train_task_config__image_classification_data_yaml_csv_aliases(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train_csv": "train.csv",
+                "val_csv": "val.csv",
+                "classes": {0: "class_a"},
+            }
+        )
+    )
+
+    config = ImageClassificationMultilabelTrainTaskConfig(
+        out="out",
+        model="some/model",
+        data=data_yaml,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(config.data, ImageClassificationMultilabelDataArgs)
+    assert config.data.train == "train.csv"
+    assert config.data.val == "val.csv"
+    assert config.data.data_config_file == data_yaml.resolve()
+
+
+def test_create_train_task_config__semantic_segmentation_data_yaml_with_classes_json(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "configs" / "data.yaml"
+    data_yaml.parent.mkdir()
+    (data_yaml.parent / "classes.json").write_text('{"0": "background", "1": "car"}')
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train": {"images": "images/train", "masks": "masks/train"},
+                "val": {"images": "images/val", "masks": "masks/val"},
+                "classes": "classes.json",
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+
+    config = SemanticSegmentationTrainTaskConfig(
+        out="out",
+        model="some/model",
+        data=data_yaml,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(config.data, MaskSemanticSegmentationDataArgs)
+    assert config.data.train.images == "images/train"
+    assert config.data.val.masks == "masks/val"
+    assert config.data.classes == Path("classes.json")
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+    data_arg_helpers.resolve_data_paths(config.data)
+
+    assert (
+        Path(config.data.train.images) == (data_yaml.parent / "images/train").resolve()
+    )
+    assert Path(config.data.val.masks) == (data_yaml.parent / "masks/val").resolve()
+    assert isinstance(config.data.classes, dict)
+    assert config.data.classes[0].name == "background"
+    assert config.data.classes[1].name == "car"
+
+
+def test_create_train_task_config__semantic_segmentation_multihead_data_yaml_with_classes_json(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "configs" / "data.yaml"
+    data_yaml.parent.mkdir()
+    (data_yaml.parent / "classes.json").write_text('{"0": "background", "1": "car"}')
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train": {"images": "images/train", "masks": "masks/train"},
+                "val": {"images": "images/val", "masks": "masks/val"},
+                "classes": "classes.json",
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+
+    config = SemanticSegmentationMultiheadTrainTaskConfig(
+        out="out",
+        model="some/model",
+        data=data_yaml,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(config.data, MaskSemanticSegmentationDataArgs)
+    assert config.data.train.images == "images/train"
+    assert config.data.val.masks == "masks/val"
+    assert config.data.classes == Path("classes.json")
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+
+def test_create_train_task_config__data_yaml_nested_unknown_key_errors(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "configs" / "data.yaml"
+    data_yaml.parent.mkdir()
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train": {
+                    "images": "images/train",
+                    "masks": "masks/train",
+                    "unknown_nested_key": "unknown",
+                },
+                "val": {"images": "images/val", "masks": "masks/val"},
+                "classes": {0: "background", 1: "car"},
+            }
+        )
+    )
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SemanticSegmentationTrainTaskConfig(
+            out="out",
+            model="some/model",
+            data=data_yaml,  # type: ignore[arg-type]
+        )
+
+
+def test_create_train_task_config__panoptic_segmentation_data_yaml(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "configs" / "data.yaml"
+    data_yaml.parent.mkdir()
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "train": {
+                    "images": "images/train",
+                    "masks": "masks/train",
+                    "annotations": "annotations/train.json",
+                },
+                "val": {
+                    "images": "images/val",
+                    "masks": "masks/val",
+                    "annotations": "annotations/val.json",
+                },
+                "extra_field_123": "extra_field_123",
+            }
+        )
+    )
+
+    config = PanopticSegmentationTrainTaskConfig(
+        out="out",
+        model="some/model",
+        data=data_yaml,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(config.data, MaskPanopticSegmentationDataArgs)
+    assert config.data.train.images == "images/train"
+    assert config.data.train.annotations == "annotations/train.json"
+    assert config.data.data_config_file == data_yaml.resolve()
+    assert "data_config_file" not in config.model_dump()["data"]
+
+    data_arg_helpers.resolve_data_paths(config.data)
+
+    assert (
+        Path(config.data.train.images) == (data_yaml.parent / "images/train").resolve()
+    )
+    assert (
+        Path(config.data.train.annotations)
+        == (data_yaml.parent / "annotations/train.json").resolve()
+    )
+    assert config.data.val.masks == (data_yaml.parent / "masks/val").resolve()
+
+
+def test_train_task_config_resolve_data_paths__yaml_relative_to_data_config(
+    tmp_path: Path,
+) -> None:
+    data_yaml = tmp_path / "configs" / "data.yaml"
+    data_yaml.parent.mkdir()
+    data_yaml.write_text(
+        yaml.dump(
+            {
+                "path": "dataset",
+                "train": "images/train",
+                "val": "images/val",
+                "names": {0: "class_a"},
+            }
+        )
+    )
+    config = ObjectDetectionTrainTaskConfig(
+        out="out",
+        model="some/model",
+        task="object_detection",
+        data=data_yaml,  # type: ignore[arg-type]
+    )
+
+    data_arg_helpers.resolve_data_paths(config.data)
+
+    assert isinstance(config.data, YOLOObjectDetectionDataArgs)
+    assert config.data.path == (data_yaml.parent / "dataset").resolve()
+    assert config.data.train == Path("images/train")
+    assert config.data.val == Path("images/val")
+
+
+def test_train_task_config_resolve_data_paths__direct_relative_to_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = ObjectDetectionTrainTaskConfig(
+        out="out",
+        model="some/model",
+        task="object_detection",
+        data={  # type: ignore[arg-type]
+            "path": "dataset",
+            "train": "images/train",
+            "val": "images/val",
+            "names": {0: "class_a"},
+        },
+    )
+
+    data_arg_helpers.resolve_data_paths(config.data)
+
+    assert isinstance(config.data, YOLOObjectDetectionDataArgs)
+    assert config.data.path == (tmp_path / "dataset").resolve()
+    assert config.data.train == Path("images/train")
+    assert config.data.val == Path("images/val")
+
+
+class TestRaiseIfTorchmetricsUnsupported:
+    def test_supported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(train_task, "TORCHMETRICS_GEQ_1_5", True, raising=True)
+        train_task._raise_if_torchmetrics_unsupported()
+
+    def test_unsupported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            train_task,
+            "TORCHMETRICS_GEQ_1_5",
+            RequirementCache("torchmetrics>=999"),
+            raising=True,
+        )
+        with pytest.raises(LightlyTrainError, match="requires torchmetrics>=999"):
+            train_task._raise_if_torchmetrics_unsupported()
